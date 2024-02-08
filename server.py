@@ -1,18 +1,20 @@
 import socket
 import os
 import re
-import sys
-import fcntl
-import errno
-from time import sleep
+import select
+import queue
 
 connection = None
 server = None
-socket_path = '/tmp/domain_socket'
+server_host = "::"
+server_port = 8080
+buffer_size = 1024
+inputs = []
+outputs = []
+message_queues = {}
+
 def main():
-    remove_existing_socket(socket_path)
     create_socket()
-    bind_socket(socket_path)
     listen_connections()
     try:
         while True:
@@ -31,61 +33,96 @@ def main():
     except Exception as e:
         print(f"Error: Failed to receive data from client")
 
-def bind_socket(path):
-    try:
-        server.bind(path)
-    except Exception as e:
-        print(f"Error: Failed to bind socket path")
-        exit(1)
-
 def create_socket():
     try:
-        global server
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        global server, inputs
+        addr = (server_host, server_port)
+        if socket.has_dualstack_ipv6():
+            server = socket.create_server(addr, family=socket.AF_INET6, dualstack_ipv6=True)
+            print("Server running on dual-stack mode (IPv4 and IPv6).")
+        else:
+            server = socket.create_server(addr)
+            print("Server running on default mode.")
+        inputs = [server]
+        server.setblocking(0)
+            
     except Exception as e:
-        print(f"Error: Faield to create socket server")
+        print(e)
+        print(f"Error: Failed to create socket server")
         exit(1)
         
-def remove_existing_socket(path):
-    try:
-        os.unlink(path)
-    except OSError:
-        if os.path.exists(path):
-            print(f"Error: Path already exists")
-            exit(1)
 
 def listen_connections():
     try:
-        server.listen(1)
-        print('Server is listening for incoming connections...')
+        server.listen(5)
+        print(f'Server is listening on port {server_port} for incoming connections...')
     except Exception as e:
         print(f"Error: Failed to listen to connections")
         exit(1)
 
 def accept_connection():
     try:
-        global connection
-        connection, client_addr = server.accept()
-        
-        print('Connection Received: ', str(connection).split(", ")[0][-4:])
-        expected_data = connection.recv(1024)
-        decoded_expected = int(expected_data.decode())
+        while inputs:
+            readable, writable, exceptional = select.select(inputs, outputs, inputs)
 
-        connection.sendall('0'.encode())
+            for s in readable:
+                if s is server:
+                    connection, client_addr = s.accept()
+                    print('Connection Received: ', client_addr)
+                    connection.setblocking(0)
+                    inputs.append(connection)
 
-        received_data = b''
-        while len(received_data) < decoded_expected:
-            try:
-                data = connection.recv(1024)
-                received_data += data
-            except Exception as e:
-                print("Error: Failed to receive data")
-        return received_data
-                
+                    message_queues[connection] = queue.Queue()
+                else:
+                    data = s.recv(1024)
+                    if data:
+                        # print(f"Receieved data from: ", s.getpeername())
+                        message_queues[s].put(data)
+                        if s not in outputs:
+                            outputs.append(s)
+                    else:
+                        # print(f"Closing: ", client_addr)
+                        if s in outputs:
+                            outputs.remove(s)
+                        inputs.remove(s)
+                        s.close()
 
+                        del message_queues[s]
 
+            for s in writable:
+                try:
+                    message_data = message_queues[s].get_nowait()
+                except queue.Empty:
+                    # print(f"Output queue for", s.getpeername(), "is empty")
+                    outputs.remove(s)
+                else:
+                    # print(f"Sending data to: ", s.getpeername())
+                    next_msg = handle_data(message_data)
+                    s.send(next_msg)
+            
+            for s in exceptional:
+                # print(f"Handling exceptional condition for: ", s.getpeername())
+                inputs.remove(s)
+                if s in outputs:
+                    outputs.remove(s)
+                s.close()
+
+                del message_queues[s]
     except Exception as e:
         print(f"Error: {e}")
+        exit(1)
+
+def handle_data(data):
+    decoded_data = check_data(data)
+    words = get_words(decoded_data)
+    word_count = get_word_count(words)
+    char_count = get_char_count(words)
+    char_freq = get_char_freq(words)
+    sorted_chars = sort_dict(char_freq)
+    response = format_response(word_count, char_count, sorted_chars)
+    response = response.encode()
+    response = decoded_data.encode()
+    return response
 
 def check_data(data):
     try:
@@ -97,7 +134,7 @@ def check_data(data):
     except Exception as e:
         print(f"Error: {e}")
         exit(1)
-        
+
 def send_response(response):
     try:
         connection.sendall(response.encode())
@@ -127,7 +164,6 @@ def remove_whitespace(word_string):
     try:
         return re.sub(' +', ' ', word_string)
     except Exception as e:
-        print(e)
         print(f"Error: Failed to remove whitespaces in data")
         exit(1)
 
